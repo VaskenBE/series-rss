@@ -1,15 +1,27 @@
-name: Test du flux RSS
+name: Publier le RSS 1080p Backup
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: series-rss-pages
+  cancel-in-progress: false
 
 jobs:
-  test:
+  publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Installer Python
@@ -17,85 +29,247 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Lire et examiner le flux
+      - name: Installer les dépendances
+        run: python -m pip install beautifulsoup4==4.13.4
+
+      - name: Construire le flux filtré
         shell: python
         run: |
+          import html
+          import os
           import re
           import urllib.request
           import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          from email.utils import format_datetime
+          from pathlib import Path
+          from urllib.parse import urlparse
 
-          url = "https://rlsbb.to/category/tv-shows/top/feed/"
-          request = urllib.request.Request(
-              url,
-              headers={"User-Agent": "SeriesRSS/1.0"}
-          )
+          from bs4 import BeautifulSoup
 
-          with urllib.request.urlopen(request, timeout=60) as response:
-              data = response.read()
-              print("Statut HTTP :", response.status)
+          SOURCE = "https://rlsbb.to/category/tv-shows/top/feed/"
+          owner, repo = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+          SITE = f"https://{owner.lower()}.github.io/{repo}/"
+          FEED = SITE + "feed.xml"
 
-          root = ET.fromstring(data)
-          items = root.findall("./channel/item")
-          print("Nombre d'articles :", len(items))
+          def fetch(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "SeriesRSS/1.0"}
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return response.read()
 
-          if not items:
-              raise RuntimeError("Aucun article RSS trouvé.")
+          def clean_url(value):
+              value = html.unescape(value.strip())
+              markdown = re.fullmatch(
+                  r"\[([^\]]+)\]\((https?://[^)]+)\)",
+                  value
+              )
+              if markdown:
+                  value = markdown.group(2)
+              if urlparse(value).scheme not in ("http", "https"):
+                  return None
+              return value
+
+          def get_candidate(block):
+              text = block.get_text(" ", strip=True)
+
+              heading = None
+              for strong in block.find_all("strong"):
+                  candidate = strong.get_text(" ", strip=True)
+                  if re.search(r"\b1080p\b", candidate, re.I):
+                      heading = candidate
+                      break
+
+              if not heading:
+                  return None
+
+              if not re.search(r"Single\s+File\s+RAR\s*:", text, re.I):
+                  return None
+
+              backup = None
+              for link in block.find_all("a", href=True):
+                  label = link.get_text(" ", strip=True)
+                  if re.fullmatch(r"RAPIDGATOR\s+Backup", label, re.I):
+                      preceding = " ".join(
+                          str(part) for part in link.previous_siblings
+                      )
+                      # The link label is checked exactly; other
+                      # Rapidgator links in this block are ignored.
+                      backup = clean_url(link["href"])
+                      break
+
+              if not backup:
+                  return None
+
+              size = re.search(
+                  r"\|\s*(\d+(?:[.,]\d+)?)\s*"
+                  r"(TiB|GiB|MiB|KiB|TB|GB|MB|KB)\b",
+                  text,
+                  re.I
+              )
+              if not size:
+                  return None
+
+              number = float(size.group(1).replace(",", "."))
+              unit = size.group(2).upper()
+              factors = {
+                  "KB": 1000,
+                  "MB": 1000**2,
+                  "GB": 1000**3,
+                  "TB": 1000**4,
+                  "KIB": 1024,
+                  "MIB": 1024**2,
+                  "GIB": 1024**3,
+                  "TIB": 1024**4,
+              }
+
+              return {
+                  "release": heading,
+                  "size": number * factors[unit],
+                  "label": f"{size.group(1)} {size.group(2)}",
+                  "url": backup,
+              }
+
+          source_root = ET.fromstring(fetch(SOURCE))
+          articles = source_root.findall("./channel/item")
+          if not articles:
+              raise RuntimeError("Le flux source ne contient aucun article.")
 
           content_tag = (
               "{http://purl.org/rss/1.0/modules/content/}encoded"
           )
-          matches = []
+          selected = {}
 
-          for item in items:
-              title = item.findtext("title", default="")
+          for article in articles:
+              original_title = article.findtext("title", default="")
               content = (
-                  item.findtext(content_tag)
-                  or item.findtext("description", default="")
+                  article.findtext(content_tag)
+                  or article.findtext("description", default="")
+              )
+              soup = BeautifulSoup(content, "html.parser")
+
+              candidates = []
+              for block in soup.find_all("p"):
+                  candidate = get_candidate(block)
+                  if candidate:
+                      candidates.append(candidate)
+
+              if not candidates:
+                  print("IGNORE :", original_title)
+                  continue
+
+              best = max(candidates, key=lambda item: item["size"])
+
+              # Keep the series and episode identifier, removing
+              # release-quality details from the visible title.
+              identity = re.split(
+                  r"\b(?:2160p|1080p|720p|480p|HDTV|WEBRip|"
+                  r"WEB-DL|WEB|HLG)\b",
+                  original_title,
+                  maxsplit=1,
+                  flags=re.I
+              )[0].strip(" .-_")
+
+              if not identity:
+                  identity = original_title
+
+              key = re.sub(r"[\W_]+", "", identity.casefold())
+              best["identity"] = identity
+              best["date"] = article.findtext("pubDate", default="")
+              best["source"] = article.findtext("link", default="")
+
+              if key not in selected or best["size"] > selected[key]["size"]:
+                  selected[key] = best
+
+          if not selected:
+              raise RuntimeError(
+                  "Aucun bloc 1080p avec taille et lien Backup trouvé. "
+                  "Publication annulée pour ne pas remplacer le flux "
+                  "par un résultat vide."
               )
 
-              has_1080p = bool(
-                  re.search(r"1080p", content, re.I)
-              )
-              has_backup = bool(
-                  re.search(r"RAPIDGATOR\s+Backup", content, re.I)
-              )
+          rss = ET.Element("rss", {"version": "2.0"})
+          channel = ET.SubElement(rss, "channel")
 
-              print(
-                  f"{title} | "
-                  f"1080p dans le contenu : {has_1080p} | "
-                  f"Backup dans le contenu : {has_backup}"
-              )
-
-              if has_1080p and has_backup:
-                  matches.append((title, content))
-
-          print(
-              "Articles contenant les deux mentions :",
-              len(matches)
+          ET.SubElement(channel, "title").text = (
+              "Séries — 1080p — Rapidgator Backup"
+          )
+          ET.SubElement(channel, "link").text = SITE
+          ET.SubElement(channel, "description").text = (
+              "Version 1080p la plus lourde disposant du lien "
+              "Single File RAR: RAPiDGATOR Backup, par publication."
+          )
+          ET.SubElement(channel, "language").text = "fr"
+          ET.SubElement(channel, "lastBuildDate").text = format_datetime(
+              datetime.now(timezone.utc)
           )
 
-          if matches:
-              title, content = matches[0]
-
-              print("\n--- EXTRAIT POUR PREPARER LE FILTRE ---")
-              print("Titre :", title)
-
-              match = re.search(
-                  r"Single\s+File\s+RAR",
-                  content,
-                  re.I
+          for key, entry in selected.items():
+              item = ET.SubElement(channel, "item")
+              ET.SubElement(item, "title").text = (
+                  f'{entry["identity"]} — 1080p — {entry["label"]}'
               )
+              ET.SubElement(item, "link").text = entry["url"]
+              ET.SubElement(
+                  item, "guid", {"isPermaLink": "false"}
+              ).text = f"series-rss:{key}"
 
-              if match:
-                  start = max(0, match.start() - 1800)
-                  end = min(len(content), match.end() + 1200)
-                  print(content[start:end])
-              else:
-                  print(content[:5000])
+              if entry["date"]:
+                  ET.SubElement(item, "pubDate").text = entry["date"]
 
-              print("--- FIN DE L'EXTRAIT ---")
-          else:
+              description = (
+                  f'<p>{html.escape(entry["release"])}</p>'
+                  f'<p>Taille : {html.escape(entry["label"])}</p>'
+                  f'<p>Single File RAR : '
+                  f'<a href="{html.escape(entry["url"], quote=True)}">'
+                  f'RAPiDGATOR Backup</a></p>'
+              )
+              ET.SubElement(item, "description").text = description
+
               print(
-                  "Aucun article ne contient les deux mentions "
-                  "dans le contenu reçu."
+                  "GARDE :",
+                  entry["identity"],
+                  "|", entry["label"],
+                  "|", entry["release"]
               )
+
+          output = Path("public")
+          output.mkdir(exist_ok=True)
+
+          ET.indent(rss, space="  ")
+          ET.ElementTree(rss).write(
+              output / "feed.xml",
+              encoding="utf-8",
+              xml_declaration=True
+          )
+
+          (output / "index.html").write_text(
+              '<!doctype html><html lang="fr"><head>'
+              '<meta charset="utf-8">'
+              '<title>Flux séries 1080p</title>'
+              '<link rel="alternate" type="application/rss+xml" '
+              'title="Séries 1080p Backup" href="feed.xml">'
+              '</head><body>'
+              '<h1>Flux séries 1080p Backup</h1>'
+              '<p><a href="feed.xml">Ouvrir le flux RSS</a></p>'
+              f'<p>{len(selected)} entrées dans le dernier traitement.</p>'
+              '</body></html>',
+              encoding="utf-8"
+          )
+
+          print("Nombre d'entrées publiées :", len(selected))
+          print("Adresse prévue du flux :", FEED)
+
+      - name: Configurer GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Préparer les fichiers à publier
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Publier le flux
+        id: deployment
+        uses: actions/deploy-pages@v4
