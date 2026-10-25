@@ -1,0 +1,77 @@
+name: Test du flux RSS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lire et examiner le flux
+        shell: python
+        run: |
+          import re
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          url = "https://rlsbb.to/category/tv-shows/top/feed/"
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "SeriesRSS/1.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=60) as response:
+              data = response.read()
+              print("Statut HTTP :", response.status)
+
+          root = ET.fromstring(data)
+          items = root.findall("./channel/item")
+          print("Nombre d'articles :", len(items))
+
+          if not items:
+              raise RuntimeError("Aucun article RSS trouvé.")
+
+          ns = "{http://purl.org/rss/1.0/modules/content/}encoded"
+          matches = []
+
+          for item in items:
+              title = item.findtext("title", default="")
+              content = item.findtext(ns) or item.findtext("description", default="")
+              has_1080p = bool(re.search(r"1080p", content, re.I))
+              has_backup = bool(
+                  re.search(r"RAPIDGATOR\s+Backup", content, re.I)
+              )
+
+              print(
+                  f"{title} | "
+                  f"1080p dans le contenu : {has_1080p} | "
+                  f"Backup dans le contenu : {has_backup}"
+              )
+
+              if has_1080p and has_backup:
+                  matches.append((title, content))
+
+          print("Articles contenant les deux mentions :", len(matches))
+
+          if matches:
+              title, content = matches[0]
+              print("\n--- EXTRAIT POUR PREPARER LE FILTRE ---")
+              print("Titre :", title)
+              match = re.search(r"Single\s+File\s+RAR", content, re.I)
+              if match:
+                  start = max(0, match.start() - 1800)
+                  end = min(len(content), match.end() + 1200)
+                  print(content[start:end])
+              else:
+                  print(content[:5000])
+              print("--- FIN DE L'EXTRAIT ---")
