@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   test:
-        runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:
@@ -41,13 +41,21 @@ jobs:
           if not items:
               raise RuntimeError("Aucun article RSS trouvé.")
 
-          ns = "{http://purl.org/rss/1.0/modules/content/}encoded"
+          content_tag = (
+              "{http://purl.org/rss/1.0/modules/content/}encoded"
+          )
           matches = []
 
           for item in items:
               title = item.findtext("title", default="")
-              content = item.findtext(ns) or item.findtext("description", default="")
-              has_1080p = bool(re.search(r"1080p", content, re.I))
+              content = (
+                  item.findtext(content_tag)
+                  or item.findtext("description", default="")
+              )
+
+              has_1080p = bool(
+                  re.search(r"1080p", content, re.I)
+              )
               has_backup = bool(
                   re.search(r"RAPIDGATOR\s+Backup", content, re.I)
               )
@@ -61,17 +69,33 @@ jobs:
               if has_1080p and has_backup:
                   matches.append((title, content))
 
-          print("Articles contenant les deux mentions :", len(matches))
+          print(
+              "Articles contenant les deux mentions :",
+              len(matches)
+          )
 
           if matches:
               title, content = matches[0]
+
               print("\n--- EXTRAIT POUR PREPARER LE FILTRE ---")
               print("Titre :", title)
-              match = re.search(r"Single\s+File\s+RAR", content, re.I)
+
+              match = re.search(
+                  r"Single\s+File\s+RAR",
+                  content,
+                  re.I
+              )
+
               if match:
                   start = max(0, match.start() - 1800)
                   end = min(len(content), match.end() + 1200)
                   print(content[start:end])
               else:
                   print(content[:5000])
+
               print("--- FIN DE L'EXTRAIT ---")
+          else:
+              print(
+                  "Aucun article ne contient les deux mentions "
+                  "dans le contenu reçu."
+              )
