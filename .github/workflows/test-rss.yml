@@ -32,7 +32,7 @@ jobs:
       - name: Installer les dépendances
         run: python -m pip install beautifulsoup4==4.13.4
 
-      - name: Construire le flux filtré
+      - name: Construire le flux filtré avec images
         shell: python
         run: |
           import html
@@ -43,7 +43,7 @@ jobs:
           from datetime import datetime, timezone
           from email.utils import format_datetime
           from pathlib import Path
-          from urllib.parse import urlparse
+          from urllib.parse import urljoin, urlparse
 
           from bs4 import BeautifulSoup
 
@@ -76,8 +76,20 @@ jobs:
 
               return value
 
+          def get_image(soup, base_url):
+              for image in soup.find_all("img"):
+                  for attribute in ("data-src", "data-lazy-src", "src"):
+                      source = image.get(attribute)
+                      if not source:
+                          continue
+
+                      image_url = clean_url(urljoin(base_url, source))
+                      if image_url:
+                          return image_url
+
+              return None
+
           def get_candidate(block):
-              # Ignore outer paragraphs containing other paragraphs.
               if block.find("p"):
                   return None
 
@@ -110,8 +122,8 @@ jobs:
                   ):
                       continue
 
-                  # Only accept a Backup link appearing after the RAR marker.
                   previous_text = []
+
                   for element in block.descendants:
                       if element is link:
                           break
@@ -186,6 +198,12 @@ jobs:
               )
 
               soup = BeautifulSoup(content, "html.parser")
+              article_url = (
+                  article.findtext("link", default="")
+                  or SOURCE
+              )
+              image_url = get_image(soup, article_url)
+
               candidates = []
 
               for block in soup.find_all("p"):
@@ -220,6 +238,7 @@ jobs:
               )
 
               best["identity"] = identity
+              best["image"] = image_url
               best["date"] = article.findtext(
                   "pubDate",
                   default=""
@@ -255,6 +274,8 @@ jobs:
               format_datetime(datetime.now(timezone.utc))
           )
 
+          image_count = 0
+
           for key, entry in selected.items():
               item = ET.SubElement(channel, "item")
 
@@ -274,12 +295,24 @@ jobs:
                       entry["date"]
                   )
 
+              image_html = ""
+
+              if entry.get("image"):
+                  image_count += 1
+                  image_html = (
+                      '<p><img class="webfeedsFeaturedVisual" '
+                      f'src="{html.escape(entry["image"], quote=True)}" '
+                      f'alt="{html.escape(entry["identity"], quote=True)}"'
+                      '></p>'
+                  )
+
               description = (
-                  f'<p>{html.escape(entry["release"])}</p>'
-                  f'<p>Taille : {html.escape(entry["label"])}</p>'
-                  '<p>Single File RAR : '
-                  f'<a href="{html.escape(entry["url"], quote=True)}">'
-                  'RAPiDGATOR Backup</a></p>'
+                  image_html
+                  + f'<p>{html.escape(entry["release"])}</p>'
+                  + f'<p>Taille : {html.escape(entry["label"])}</p>'
+                  + '<p>Single File RAR : '
+                  + f'<a href="{html.escape(entry["url"], quote=True)}">'
+                  + 'RAPiDGATOR Backup</a></p>'
               )
 
               ET.SubElement(item, "description").text = description
@@ -289,6 +322,8 @@ jobs:
                   entry["identity"],
                   "|",
                   entry["label"],
+                  "| Image :",
+                  "oui" if entry.get("image") else "non",
                   "|",
                   entry["release"]
               )
@@ -313,11 +348,13 @@ jobs:
               '<h1>TV Shows — RSS 1080p Backup</h1>'
               '<p><a href="feed.xml">Ouvrir le flux RSS</a></p>'
               f'<p>{len(selected)} entrées dans le dernier traitement.</p>'
+              f'<p>{image_count} entrées avec image.</p>'
               '</body></html>',
               encoding="utf-8"
           )
 
           print("Nombre d'entrées publiées :", len(selected))
+          print("Nombre d'entrées avec image :", image_count)
           print("Adresse prévue du flux :", FEED)
 
       - name: Configurer GitHub Pages
