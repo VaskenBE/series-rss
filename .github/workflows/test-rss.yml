@@ -1,3 +1,4 @@
+
 name: Publier le RSS TV Shows 1080p Backup
 
 on:
@@ -48,6 +49,14 @@ jobs:
           from bs4 import BeautifulSoup
 
           SOURCE = "https://rlsbb.to/category/tv-shows/feed/"
+
+          MEDIA_NS = "http://search.yahoo.com/mrss/"
+          CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
+
+          # Enregistrement des namespaces RSS
+          ET.register_namespace("media", MEDIA_NS)
+          ET.register_namespace("content", CONTENT_NS)
+
           owner, repo = os.environ["GITHUB_REPOSITORY"].split("/", 1)
           SITE = f"https://{owner.lower()}.github.io/{repo}/"
           FEED = SITE + "feed.xml"
@@ -63,27 +72,40 @@ jobs:
 
           def clean_url(value):
               value = html.unescape(value.strip())
+
               markdown = re.fullmatch(
                   r"\[([^\]]+)\]\((https?://[^)]+)\)",
                   value
               )
+
               if markdown:
                   value = markdown.group(2)
 
               parsed = urlparse(value)
+
               if parsed.scheme not in ("http", "https") or not parsed.netloc:
                   return None
 
               return value
 
           def get_image(soup, base_url):
+              # Priorité aux images principales et aux images différées
               for image in soup.find_all("img"):
-                  for attribute in ("data-src", "data-lazy-src", "src"):
+                  for attribute in (
+                      "data-src",
+                      "data-lazy-src",
+                      "data-original",
+                      "src"
+                  ):
                       source = image.get(attribute)
+
                       if not source:
                           continue
 
-                      image_url = clean_url(urljoin(base_url, source))
+                      image_url = clean_url(
+                          urljoin(base_url, source)
+                      )
+
                       if image_url:
                           return image_url
 
@@ -94,19 +116,23 @@ jobs:
                   return None
 
               heading = block.find("strong")
+
               if heading is None:
                   return None
 
               release = heading.get_text(" ", strip=True)
+
               if not re.search(r"\b1080p\b", release, re.I):
                   return None
 
               text = block.get_text(" ", strip=True)
+
               marker = re.search(
                   r"Single\s+File\s+RAR\s*:",
                   text,
                   re.I
               )
+
               if not marker:
                   return None
 
@@ -127,6 +153,7 @@ jobs:
                   for element in block.descendants:
                       if element is link:
                           break
+
                       if isinstance(element, str):
                           previous_text.append(str(element))
 
@@ -138,6 +165,7 @@ jobs:
                       continue
 
                   backup = clean_url(link["href"])
+
                   if backup:
                       break
 
@@ -150,10 +178,14 @@ jobs:
                   text,
                   re.I
               )
+
               if not size:
                   return None
 
-              number = float(size.group(1).replace(",", "."))
+              number = float(
+                  size.group(1).replace(",", ".")
+              )
+
               unit = size.group(2).upper()
 
               factors = {
@@ -174,7 +206,9 @@ jobs:
                   "url": backup,
               }
 
+          # Récupération du flux source
           source_root = ET.fromstring(fetch(SOURCE))
+
           articles = source_root.findall("./channel/item")
 
           print("Source :", SOURCE)
@@ -188,26 +222,37 @@ jobs:
           content_tag = (
               "{http://purl.org/rss/1.0/modules/content/}encoded"
           )
+
           selected = {}
 
+          # Analyse des articles
           for article in articles:
-              original_title = article.findtext("title", default="")
+
+              original_title = article.findtext(
+                  "title",
+                  default=""
+              )
+
               content = (
                   article.findtext(content_tag)
                   or article.findtext("description", default="")
               )
 
               soup = BeautifulSoup(content, "html.parser")
+
               article_url = (
                   article.findtext("link", default="")
                   or SOURCE
               )
+
+              # Extraction de l'image
               image_url = get_image(soup, article_url)
 
               candidates = []
 
               for block in soup.find_all("p"):
                   candidate = get_candidate(block)
+
                   if candidate:
                       candidates.append(candidate)
 
@@ -215,6 +260,7 @@ jobs:
                   print("IGNORE :", original_title)
                   continue
 
+              # Sélection du fichier le plus lourd
               best = max(
                   candidates,
                   key=lambda candidate: candidate["size"]
@@ -239,11 +285,13 @@ jobs:
 
               best["identity"] = identity
               best["image"] = image_url
+
               best["date"] = article.findtext(
                   "pubDate",
                   default=""
               )
 
+              # Conservation de la meilleure release par série
               if (
                   key not in selected
                   or best["size"] > selected[key]["size"]
@@ -257,31 +305,43 @@ jobs:
                   "Publication annulée pour éviter un flux vide."
               )
 
-          rss = ET.Element("rss", {"version": "2.0"})
+          # Construction du flux RSS
+          rss = ET.Element(
+              "rss",
+              {"version": "2.0"}
+          )
+
           channel = ET.SubElement(rss, "channel")
 
           ET.SubElement(channel, "title").text = (
               "TV Shows — 1080p — Rapidgator Backup"
           )
+
           ET.SubElement(channel, "link").text = SITE
+
           ET.SubElement(channel, "description").text = (
               "Depuis le flux général TV Shows : "
               "version 1080p la plus lourde disposant du lien "
               "Single File RAR: RAPiDGATOR Backup."
           )
+
           ET.SubElement(channel, "language").text = "fr"
+
           ET.SubElement(channel, "lastBuildDate").text = (
               format_datetime(datetime.now(timezone.utc))
           )
 
           image_count = 0
 
+          # Génération des articles RSS
           for key, entry in selected.items():
+
               item = ET.SubElement(channel, "item")
 
               ET.SubElement(item, "title").text = (
                   f'{entry["identity"]} — 1080p — {entry["label"]}'
               )
+
               ET.SubElement(item, "link").text = entry["url"]
 
               ET.SubElement(
@@ -295,15 +355,31 @@ jobs:
                       entry["date"]
                   )
 
+              # Construction de la description HTML
               image_html = ""
 
               if entry.get("image"):
+
                   image_count += 1
+
+                  image_url = html.escape(
+                      entry["image"],
+                      quote=True
+                  )
+
+                  image_alt = html.escape(
+                      entry["identity"],
+                      quote=True
+                  )
+
                   image_html = (
-                      '<p><img class="webfeedsFeaturedVisual" '
-                      f'src="{html.escape(entry["image"], quote=True)}" '
-                      f'alt="{html.escape(entry["identity"], quote=True)}"'
-                      '></p>'
+                      '<p>'
+                      '<img class="webfeedsFeaturedVisual" '
+                      f'src="{image_url}" '
+                      f'alt="{image_alt}" '
+                      'style="display:block;max-width:100%;'
+                      'height:auto;margin:0 auto;">'
+                      '</p>'
                   )
 
               description = (
@@ -312,10 +388,42 @@ jobs:
                   + f'<p>Taille : {html.escape(entry["label"])}</p>'
                   + '<p>Single File RAR : '
                   + f'<a href="{html.escape(entry["url"], quote=True)}">'
-                  + 'RAPiDGATOR Backup</a></p>'
+                  + 'RAPIDGATOR Backup</a></p>'
               )
 
-              ET.SubElement(item, "description").text = description
+              # 1. Description RSS classique
+              ET.SubElement(
+                  item,
+                  "description"
+              ).text = description
+
+              # 2. Image principale Media RSS
+              if entry.get("image"):
+
+                  ET.SubElement(
+                      item,
+                      f"{{{MEDIA_NS}}}content",
+                      {
+                          "url": entry["image"],
+                          "medium": "image"
+                      }
+                  )
+
+                  # 3. Miniature Media RSS
+                  ET.SubElement(
+                      item,
+                      f"{{{MEDIA_NS}}}thumbnail",
+                      {
+                          "url": entry["image"]
+                      }
+                  )
+
+              # 4. Contenu HTML complet
+              # L'image est placée avant le résumé
+              ET.SubElement(
+                  item,
+                  f"{{{CONTENT_NS}}}encoded"
+              ).text = description
 
               print(
                   "GARDE :",
@@ -328,16 +436,19 @@ jobs:
                   entry["release"]
               )
 
+          # Publication des fichiers
           output = Path("public")
           output.mkdir(exist_ok=True)
 
           ET.indent(rss, space="  ")
+
           ET.ElementTree(rss).write(
               output / "feed.xml",
               encoding="utf-8",
               xml_declaration=True
           )
 
+          # Page d'accueil
           (output / "index.html").write_text(
               '<!doctype html><html lang="fr"><head>'
               '<meta charset="utf-8">'
